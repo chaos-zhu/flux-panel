@@ -459,9 +459,14 @@ func (c *detectConn) Read(b []byte) (int, error) {
 }
 
 func detectProtocol(data []byte, conn net.Conn) (blocked bool) {
+	// 如果是 UDP，则不检测，直接放行
+	if conn.RemoteAddr().Network() == "udp" || conn.RemoteAddr().Network() == "udp4" || conn.RemoteAddr().Network() == "udp6" {
+		return false
+	}
+
 	if isHttp == 1 && detectHTTP(data) {
 		conn.Close()
-		return false
+		return true
 	}
 
 	if isTls == 1 && detectTLS(data) {
