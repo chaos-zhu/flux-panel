@@ -2,12 +2,13 @@ name: Build and Push Images Based on Version
 
 # 在这里定义统一版本号
 env:
-  VERSION: "1.4.2"
+  VERSION: "2.0.2-beta"
 
 on:
   push:
     branches:
       - main
+      - beta
 
 jobs:
   check-version:
@@ -16,10 +17,11 @@ jobs:
     outputs:
       version: ${{ env.VERSION }}
       should_build: ${{ steps.check-tag.outputs.should_build }}
+      tag_exists: ${{ steps.check-tag.outputs.tag_exists }}
     steps:
       - uses: actions/checkout@v3
         with:
-          fetch-depth: 0  # 获取所有历史和 tags
+          fetch-depth: 0
 
       - name: Display version
         run: |
@@ -29,11 +31,13 @@ jobs:
         id: check-tag
         run: |
           if git rev-parse "${{ env.VERSION }}" >/dev/null 2>&1; then
-            echo "Tag ${{ env.VERSION }} already exists, skip build"
+            echo "Tag ${{ env.VERSION }} already exists, will only update files"
             echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
           else
             echo "Tag ${{ env.VERSION }} does not exist, will build all components"
             echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
           fi
 
   build-gost:
@@ -66,21 +70,37 @@ jobs:
           sudo mv upx-4.2.1-amd64_linux/upx /usr/local/bin/
           rm -rf upx-4.2.1-amd64_linux*
 
-      - name: Build GOST binary
+      - name: Build GOST binary (AMD64)
         working-directory: ./go-gost
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o gost
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o gost-amd64
 
-      - name: Compress with UPX
+      - name: Build GOST binary (ARM64)
         working-directory: ./go-gost
         run: |
-          upx --best --lzma gost
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o gost-arm64
 
-      - name: Upload GOST artifact
+      - name: Compress with UPX (AMD64)
+        working-directory: ./go-gost
+        run: |
+          upx --best --lzma gost-amd64
+
+      - name: Compress with UPX (ARM64)
+        working-directory: ./go-gost
+        run: |
+          upx --best --lzma gost-arm64
+
+      - name: Upload GOST AMD64 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gost-binary
-          path: ./go-gost/gost
+          name: gost-binary-amd64
+          path: ./go-gost/gost-amd64
+
+      - name: Upload GOST ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gost-binary-arm64
+          path: ./go-gost/gost-arm64
 
   build-vite:
     name: Build & Push Vite Frontend
@@ -108,7 +128,7 @@ jobs:
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64 \
             --push \
             -t bqlpfy/vite-frontend:latest \
             -t bqlpfy/vite-frontend:${VERSION} \
@@ -152,7 +172,7 @@ jobs:
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64 \
             --push \
             -t bqlpfy/springboot-backend:latest \
             -t bqlpfy/springboot-backend:${VERSION} \
@@ -168,11 +188,22 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Download GOST binary
+      - name: Download GOST AMD64 binary
         uses: actions/download-artifact@v4
         with:
-          name: gost-binary
-          path: ./artifacts
+          name: gost-binary-amd64
+          path: ./artifacts/amd64
+
+      - name: Download GOST ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gost-binary-arm64
+          path: ./artifacts/arm64
+
+      - name: Rename binaries
+        run: |
+          mv ./artifacts/amd64/gost-amd64 ./artifacts/gost-amd64
+          mv ./artifacts/arm64/gost-arm64 ./artifacts/gost-arm64
 
       - name: Create Release
         env:
@@ -184,39 +215,81 @@ jobs:
           git tag "${VERSION}" ${{ github.sha }}
           git push origin "${VERSION}"
           
+          # 获取 commit 信息
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s")
+          COMMIT_AUTHOR=$(git log -1 --pretty=format:"%an")
+          COMMIT_DATE=$(git log -1 --pretty=format:"%ai")
+          
           # 创建 release
           gh release create "${VERSION}" \
             --title "Release ${VERSION}" \
             --notes "Version ${VERSION}
           
-          ## Components
-          - **GOST Binary** (Linux AMD64, compressed with UPX)
-          - **Vite Frontend** Docker Image: \`bqlpfy/vite-frontend:${VERSION}\` / \`bqlpfy/vite-frontend:latest\`
-          - **Spring Boot Backend** Docker Image: \`bqlpfy/springboot-backend:${VERSION}\` / \`bqlpfy/springboot-backend:latest\`
+          ## 📝 Commit Information
+          - **Message**: ${COMMIT_MSG}
+          - **Author**: ${COMMIT_AUTHOR}
+          - **Date**: ${COMMIT_DATE}
+          - **Commit**: [\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
           
-          ## Installation Files
+          ## 📦 Components
+          - **GOST Binary AMD64** - \`gost-amd64\` (Linux x86_64, compressed with UPX)
+          - **GOST Binary ARM64** - \`gost-arm64\` (Linux ARM64/aarch64, compressed with UPX)
+          - **Vite Frontend** Docker Image: \`bqlpfy/vite-frontend:${VERSION}\` / \`bqlpfy/vite-frontend:latest\` (支持 AMD64/ARM64)
+          - **Spring Boot Backend** Docker Image: \`bqlpfy/springboot-backend:${VERSION}\` / \`bqlpfy/springboot-backend:latest\` (支持 AMD64/ARM64)
+          
+          ## 📥 Installation Files
           - \`install.sh\` - GOST 客户端安装脚本
           - \`panel_install.sh\` - 面板安装脚本
-          - \`gost.sql\` - 数据库初始化文件
           - \`docker-compose-v4.yml\` - Docker Compose 配置 (IPv4)
           - \`docker-compose-v6.yml\` - Docker Compose 配置 (IPv6)
           
-          ## Details
+          ## ℹ️ Build Details
           - Build date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          - Commit: ${{ github.sha }}" \
+          - Branch: ${{ github.ref_name }}" \
             --repo ${{ github.repository }}
           
           # 上传所有文件到 release
-          echo "📤 上传 GOST 二进制..."
-          gh release upload "${VERSION}" ./artifacts/gost --clobber
+          echo "📤 上传 GOST 二进制文件..."
+          gh release upload "${VERSION}" ./artifacts/gost-amd64 --clobber
+          gh release upload "${VERSION}" ./artifacts/gost-arm64 --clobber
           
           echo "📤 上传安装脚本..."
           gh release upload "${VERSION}" ./install.sh --clobber
           gh release upload "${VERSION}" ./panel_install.sh --clobber
           
-          echo "📤 上传配置文件..."
-          gh release upload "${VERSION}" ./gost.sql --clobber
+          echo "📤 上传 Docker Compose 配置文件..."
           gh release upload "${VERSION}" ./docker-compose-v4.yml --clobber
           gh release upload "${VERSION}" ./docker-compose-v6.yml --clobber
           
           echo "✅ 所有文件已上传到 Release ${VERSION}"
+
+  update-release-files:
+    name: Update Release Files Only
+    needs: check-version
+    if: needs.check-version.outputs.tag_exists == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Update Release Files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          
+          echo "📤 更新 Release ${VERSION} 中的脚本和配置文件..."
+          
+          # 上传安装脚本（覆盖）
+          echo "📤 更新安装脚本..."
+          gh release upload "${VERSION}" ./install.sh --clobber
+          gh release upload "${VERSION}" ./panel_install.sh --clobber
+          
+          # 上传 Docker Compose 配置文件（覆盖）
+          echo "📤 更新 Docker Compose 配置文件..."
+          gh release upload "${VERSION}" ./docker-compose-v4.yml --clobber
+          gh release upload "${VERSION}" ./docker-compose-v6.yml --clobber
+          
+          echo "✅ 文件更新完成！Release ${VERSION} 中的脚本和配置已更新"
+          echo "ℹ️ Docker 镜像和 GOST 二进制未重新构建"
