@@ -2,7 +2,7 @@ name: Build and Push Images Based on Version
 
 # 在这里定义统一版本号
 env:
-  VERSION: "2.0.2-beta"
+  VERSION: "2.0.6-beta"
 
 on:
   push:
@@ -17,6 +17,7 @@ jobs:
     outputs:
       version: ${{ env.VERSION }}
       should_build: ${{ steps.check-tag.outputs.should_build }}
+      should_build_gost: ${{ steps.check-tag.outputs.should_build_gost }}
       tag_exists: ${{ steps.check-tag.outputs.tag_exists }}
     steps:
       - uses: actions/checkout@v3
@@ -27,23 +28,34 @@ jobs:
         run: |
           echo "Current version: ${{ env.VERSION }}"
 
-      - name: Check if tag exists
+      - name: Check if tag exists and detect changes
         id: check-tag
         run: |
           if git rev-parse "${{ env.VERSION }}" >/dev/null 2>&1; then
-            echo "Tag ${{ env.VERSION }} already exists, will only update files"
-            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "Tag ${{ env.VERSION }} already exists"
             echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            
+            # 检查从tag到现在，go-gost目录下的文件是否有变化
+            TAG_COMMIT=$(git rev-list -n 1 "${{ env.VERSION }}")
+            if git diff --quiet $TAG_COMMIT HEAD -- go-gost/; then
+              echo "✅ GOST files unchanged since tag"
+              echo "should_build_gost=false" >> $GITHUB_OUTPUT
+            else
+              echo "🔄 GOST files changed since tag, will rebuild GOST binary"
+              echo "should_build_gost=true" >> $GITHUB_OUTPUT
+            fi
           else
             echo "Tag ${{ env.VERSION }} does not exist, will build all components"
             echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "should_build_gost=true" >> $GITHUB_OUTPUT
             echo "tag_exists=false" >> $GITHUB_OUTPUT
           fi
 
   build-gost:
     name: Build & Compress GOST Binary
     needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
+    if: needs.check-version.outputs.should_build_gost == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -223,29 +235,11 @@ jobs:
           # 创建 release
           gh release create "${VERSION}" \
             --title "Release ${VERSION}" \
-            --notes "Version ${VERSION}
-          
-          ## 📝 Commit Information
+            --notes "## 📝 Commit Information
           - **Message**: ${COMMIT_MSG}
           - **Author**: ${COMMIT_AUTHOR}
           - **Date**: ${COMMIT_DATE}
-          - **Commit**: [\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
-          
-          ## 📦 Components
-          - **GOST Binary AMD64** - \`gost-amd64\` (Linux x86_64, compressed with UPX)
-          - **GOST Binary ARM64** - \`gost-arm64\` (Linux ARM64/aarch64, compressed with UPX)
-          - **Vite Frontend** Docker Image: \`bqlpfy/vite-frontend:${VERSION}\` / \`bqlpfy/vite-frontend:latest\` (支持 AMD64/ARM64)
-          - **Spring Boot Backend** Docker Image: \`bqlpfy/springboot-backend:${VERSION}\` / \`bqlpfy/springboot-backend:latest\` (支持 AMD64/ARM64)
-          
-          ## 📥 Installation Files
-          - \`install.sh\` - GOST 客户端安装脚本
-          - \`panel_install.sh\` - 面板安装脚本
-          - \`docker-compose-v4.yml\` - Docker Compose 配置 (IPv4)
-          - \`docker-compose-v6.yml\` - Docker Compose 配置 (IPv6)
-          
-          ## ℹ️ Build Details
-          - Build date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          - Branch: ${{ github.ref_name }}" \
+          - **Commit**: [\`${GITHUB_SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})" \
             --repo ${{ github.repository }}
           
           # 上传所有文件到 release
@@ -263,10 +257,51 @@ jobs:
           
           echo "✅ 所有文件已上传到 Release ${VERSION}"
 
+  update-release-gost:
+    name: Update GOST Binaries in Release
+    needs: [check-version, build-gost]
+    if: needs.check-version.outputs.should_build == 'false' && needs.check-version.outputs.should_build_gost == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download GOST AMD64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gost-binary-amd64
+          path: ./artifacts/amd64
+
+      - name: Download GOST ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gost-binary-arm64
+          path: ./artifacts/arm64
+
+      - name: Rename binaries
+        run: |
+          mv ./artifacts/amd64/gost-amd64 ./artifacts/gost-amd64
+          mv ./artifacts/arm64/gost-arm64 ./artifacts/gost-arm64
+
+      - name: Update GOST binaries in Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          
+          echo "🔄 更新 Release ${VERSION} 中的 GOST 二进制文件..."
+          
+          gh release upload "${VERSION}" ./artifacts/gost-amd64 --clobber
+          gh release upload "${VERSION}" ./artifacts/gost-arm64 --clobber
+          
+          echo "✅ GOST 二进制文件更新完成！"
+          echo "ℹ️ Docker 镜像未重新构建"
+
   update-release-files:
     name: Update Release Files Only
     needs: check-version
-    if: needs.check-version.outputs.tag_exists == 'true'
+    if: needs.check-version.outputs.tag_exists == 'true' && needs.check-version.outputs.should_build == 'false' && needs.check-version.outputs.should_build_gost == 'false'
     runs-on: ubuntu-latest
     permissions:
       contents: write
